@@ -32,8 +32,6 @@ from gateway.platforms.signal import (
 from . import commands, observability
 from ._util import (
     DELETE_ALERT_DEFAULT_NAME,
-    DELETE_WATCH_DEFAULT_NAMES,
-    coerce_str_list,
     extract_delete_timestamp_from_obj,
     normalize_token,
 )
@@ -54,7 +52,8 @@ class SignalGroupChatAdapter(AccessControlMixin, DeleteWatchMixin, _UpstreamSign
         super().__init__(config)
         extra = config.extra or {}
 
-        # --- delete-watch state ---
+        # --- delete-watch state (which rooms are watched lives in the store,
+        # OFF by default; alerts go to ONE central chat) ---
         self._delete_cache_path = Path(
             extra.get("delete_cache_path")
             or os.getenv("SIGNAL_DELETE_CACHE_PATH")
@@ -63,19 +62,7 @@ class SignalGroupChatAdapter(AccessControlMixin, DeleteWatchMixin, _UpstreamSign
         self._delete_cache_conn = None
         self._delete_cache_lock = asyncio.Lock()
         self._delete_cache_last_prune = 0.0
-
-        self._delete_watch_name = str(
-            extra.get("delete_watch_name")
-            or os.getenv("SIGNAL_DELETE_WATCH_NAME")
-            or DELETE_WATCH_DEFAULT_NAMES[0]
-        ).strip()
-        watch_ids = coerce_str_list(extra.get("delete_watch_chat_ids") or os.getenv("SIGNAL_DELETE_WATCH_CHAT_IDS"))
-        watch_names = coerce_str_list(extra.get("delete_watch_chat_names") or os.getenv("SIGNAL_DELETE_WATCH_CHAT_NAMES"))
-        if not watch_names and not watch_ids:
-            watch_names = list(DELETE_WATCH_DEFAULT_NAMES)
-        self._delete_watch_aliases = {normalize_token(v) for v in watch_ids + watch_names if normalize_token(v)}
-        self._delete_watch_canonical_ids: set = set()
-        self._delete_watch_labels: set = set()
+        self._delete_cache_last_vacuum = 0.0
         self._delete_alert_chat_id = (
             extra.get("delete_alert_chat_id") or os.getenv("SIGNAL_DELETE_ALERT_CHAT_ID") or ""
         ).strip()
@@ -84,7 +71,6 @@ class SignalGroupChatAdapter(AccessControlMixin, DeleteWatchMixin, _UpstreamSign
             or os.getenv("SIGNAL_DELETE_ALERT_CHAT_LABEL")
             or DELETE_ALERT_DEFAULT_NAME
         ).strip()
-        self._delete_watch_active = True
 
         # --- backup-aware grant/mode store + group-mode helpers ---
         self._store = ConfigStore()
@@ -105,17 +91,12 @@ class SignalGroupChatAdapter(AccessControlMixin, DeleteWatchMixin, _UpstreamSign
         ok = await super().connect()
         if ok:
             try:
-                await self._prime_delete_watch_aliases()
+                await self._resolve_alert_chat()
             except Exception as e:  # pragma: no cover
-                logger.debug("delete-watch prime failed: %s", e)
+                logger.debug("delete-watch alert-chat resolve failed: %s", e)
         return ok
 
     # -- small overrides -----------------------------------------------------
-
-    def _remember_recipient_identifiers(self, number: str | None, service_id: str | None) -> None:
-        super()._remember_recipient_identifiers(number, service_id)
-        if number and service_id and self._delete_watch_active and service_id in self._delete_watch_canonical_ids:
-            self._delete_watch_aliases.add(normalize_token(number))
 
     async def send_image(self, chat_id: str, image_url: str, caption: str | None = None, **kwargs):
         if image_url.startswith("file://"):
@@ -148,7 +129,6 @@ class SignalGroupChatAdapter(AccessControlMixin, DeleteWatchMixin, _UpstreamSign
         is_note_to_self = False
         is_sync_group_msg = False
         is_delete_watch_message = False
-        watch_chat_id_override: str | None = None
         sent_msg: dict | None = None
         if "syncMessage" in envelope_data:
             sync_msg = envelope_data.get("syncMessage")
@@ -159,9 +139,9 @@ class SignalGroupChatAdapter(AccessControlMixin, DeleteWatchMixin, _UpstreamSign
                     sent_ts = sent_msg.get("timestamp")
                     group_info = sent_msg.get("groupInfo")
                     sync_group_id = group_info.get("groupId") if group_info else None
-                    if self._message_matches_delete_watch(sent_msg, envelope_data):
+                    if extract_delete_timestamp_from_obj(sent_msg) is not None:
+                        # Owner deleted a message from their phone — promote so we process it.
                         is_delete_watch_message = True
-                        watch_chat_id_override = self._delete_watch_storage_room_id()
                         envelope_data = {**envelope_data, "dataMessage": sent_msg}
                     if dest == self._account_normalized:
                         if sent_ts and sent_ts in self._recent_sent_timestamps:
@@ -199,25 +179,14 @@ class SignalGroupChatAdapter(AccessControlMixin, DeleteWatchMixin, _UpstreamSign
             logger.debug("Signal: ignoring envelope with no sender")
             return
 
-        is_delete_watch_candidate = self._delete_watch_active and self._message_matches_delete_watch(envelope_data, sent_msg)
+        is_delete = extract_delete_timestamp_from_obj(envelope_data) is not None
 
         if (self._account_normalized and sender == self._account_normalized
                 and not is_note_to_self and not is_sync_group_msg
-                and not is_delete_watch_message and not is_delete_watch_candidate):
+                and not is_delete_watch_message and not is_delete):
             return
 
         if self.ignore_stories and envelope_data.get("storyMessage"):
-            return
-
-        delete_ts = extract_delete_timestamp_from_obj(envelope_data)
-        if delete_ts is not None:
-            if self._message_matches_delete_watch(envelope_data, sent_msg):
-                await self._handle_delete_watch_event(
-                    room_chat_id=watch_chat_id_override or self._delete_watch_storage_room_id(),
-                    deleted_ts=delete_ts,
-                    envelope_data=envelope_data,
-                    data_message=sent_msg,
-                )
             return
 
         data_message = (
@@ -250,9 +219,17 @@ class SignalGroupChatAdapter(AccessControlMixin, DeleteWatchMixin, _UpstreamSign
                 return
 
         chat_id = sender if not is_group else f"group:{group_id}"
-        if watch_chat_id_override:
-            chat_id = watch_chat_id_override
         chat_type = "group" if is_group else "dm"
+        chat_name = (group_info.get("groupName") if group_info else sender_name) or chat_id
+
+        # --- delete-watch: recover remote-delete events for watched chats ---
+        delete_ts = extract_delete_timestamp_from_obj(data_message) or extract_delete_timestamp_from_obj(envelope_data)
+        if delete_ts is not None:
+            if self._delete_watch_enabled(chat_id):
+                await self._handle_delete_watch_event(
+                    chat_id=chat_id, room_label=chat_name, deleted_ts=delete_ts, data_message=data_message,
+                )
+            return
 
         text = data_message.get("message", "")
         mentions = data_message.get("mentions", [])
@@ -298,17 +275,14 @@ class SignalGroupChatAdapter(AccessControlMixin, DeleteWatchMixin, _UpstreamSign
             chat_id_alt=group_id if is_group else None,
         )
 
-        if self._message_matches_delete_watch(envelope_data, data_message, sent_msg):
+        # --- delete-watch: capture so a future delete can be recovered (non-terminal) ---
+        if self._delete_watch_enabled(chat_id):
             await self._store_delete_watch_message(
-                room_chat_id=watch_chat_id_override or self._delete_watch_storage_room_id(),
-                room_label=self._delete_watch_name,
-                sender_id=sender or "",
-                sender_name=sender_name or "",
+                chat_id=chat_id, room_label=chat_name,
+                sender_id=sender or "", sender_name=sender_name or "",
                 timestamp_ms=ts_ms or int(time.time() * 1000),
-                data_message=data_message,
-                envelope_data=envelope_data,
+                text=text or "", data_message=data_message,
             )
-            return
 
         msg_type = MessageType.TEXT
         if media_types:

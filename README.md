@@ -12,7 +12,7 @@ It **subclasses the upstream Signal adapter** (inheriting upstream fixes — no 
 - **Summon triggers** (group mode): the `/agent` keyword, an **@mention**, a **reply** to one of Hermes's messages, or a configurable **wake-word**.
 - **Access control** — owner-only DMs; per-group guest **`/approve`** / **`/revoke`** with a two-message owner notification flow.
 - **Backup-aware security state** — approvals, dynamic groups, and per-group modes are stored in `/opt/data/platforms/pairing/signal-group-chat.json` so they ride Hermes's pre-update snapshots **and** full backups. Layered config: runtime store → `config.yaml` (`plugins.entries.signal-group-chat`) → `SIGNAL_*` env (bootstrap). Atomic writes, mtime-cached reads, `0600` perms.
-- **Deleted-message watch** — recovers remote-deleted messages from a watched contact/room to an alert chat.
+- **Deleted-message watch** — recovers "delete for everyone" messages to ONE central alert chat (never leaked back into the room). **Off by default**; opt in per room or `*` for all (`/delete-watch add *`). Retention follows Signal's 24h delete window (+2h buffer = 26h TTL); a size cap + periodic VACUUM keep the cache small. Bootstrap seed via `SIGNAL_DELETE_WATCH_ROOMS` (`*` or comma-separated ids); live control via `/delete-watch` (stored in the pairing file, reloads in real time — not env).
 - **File staging** — auto-copies attachments into the shared `/opt/data` volume so signal-cli can deliver them (covers both adapter sends and the `send_message` tool).
 - **Owner admin commands** (in-group): `/mode`, `/status`, `/forget`, `/wake add|remove|list`, `/help`, plus `/approve` / `/revoke`.
 - **Observability** — append-only audit log (`/opt/data/signal-audit.jsonl`) of approvals/revokes/mode-changes/summons, plus per-group counters surfaced by `/status`.
@@ -51,6 +51,10 @@ Declarative policy can also be set under `plugins.entries.signal-group-chat` in 
 /forget                  # clear the recent-conversation buffer
 /approve +15551234567    # grant a guest access in this group
 /revoke +15551234567
+/delete-watch add *      # watch all rooms for deleted messages (off by default)
+/delete-watch add here   # watch just this room
+/delete-watch remove *   # stop watching all
+/delete-watch status     # scope, cached count, stale, ages, top rooms
 ```
 
 ## Development

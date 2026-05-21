@@ -1,10 +1,17 @@
-"""Deleted-message watching with a small local SQLite cache.
+"""Deleted-message watching across ALL chats (opt-out per room).
 
-A mixin over the upstream SignalAdapter. Watches one configured contact/room;
-caches its messages and, when a remote-delete event arrives, recovers the
-original text and forwards it to a configured alert chat.
+Model: Hermes captures every message it sees (in chats where delete-watch is
+enabled — on by default) into a small SQLite cache keyed by the message's real
+chat id. When a "delete for everyone" event arrives for an enabled chat, the
+original is recovered and forwarded to ONE central alert chat (the home group),
+never back into the room where the delete happened.
 
-Lifted from the previous forked signal.py (behavior-preserving).
+Retention follows Signal's delete window: a message can only be deleted-for-
+everyone within 24h of sending, so we keep cache rows for 24h + a 2h safety
+buffer (26h total). Past that a message can never be deleted, so it's pruned.
+A global row cap + periodic VACUUM are safety backstops against disk growth.
+
+A mixin over the upstream SignalAdapter.
 """
 
 from __future__ import annotations
@@ -19,17 +26,53 @@ from gateway.platforms.signal import MAX_MESSAGE_LENGTH
 from ._util import (
     DELETE_CACHE_PRUNE_INTERVAL_SECONDS,
     DELETE_CACHE_TTL_SECONDS,
-    message_tokens,
-    normalize_token,
     signal_directory_entries,
     signal_entry_chat_id,
 )
-from .observability import logger
+from .config_store import plugin_setting
+from .observability import audit, logger
+
+# Safety backstops (the TTL is the real limiter; these guard against runaway growth).
+_VACUUM_INTERVAL_SECONDS = 6 * 60 * 60
 
 
 class DeleteWatchMixin:
-    # adapter provides: self._delete_* attributes, self._rpc, self.account,
-    # self._resolve_recipient, self._track_sent_timestamp
+    # adapter provides: self._delete_cache_path/_conn/_lock/_last_prune/_last_vacuum,
+    # self._delete_alert_chat_id, self._delete_alert_chat_label, self._store,
+    # self._rpc, self.account, self._resolve_recipient, self._track_sent_timestamp
+
+    # -- enablement ----------------------------------------------------------
+
+    def _delete_watch_enabled(self, chat_id: str) -> bool:
+        try:
+            return self._store.delete_watch_enabled(chat_id)
+        except Exception:
+            return True
+
+    def _delete_watch_max_rows(self) -> int:
+        try:
+            return int(plugin_setting("delete_watch_max_rows", 50000, env="SIGNAL_DELETE_MAX_ROWS") or 50000)
+        except (TypeError, ValueError):
+            return 50000
+
+    # -- alert chat resolution (central; no per-room leakage) ----------------
+
+    async def _resolve_alert_chat(self) -> None:
+        """Resolve the central alert chat id once (env > label lookup > home channel)."""
+        if not self._delete_alert_chat_id and self._delete_alert_chat_label:
+            for entry in signal_directory_entries(self._delete_alert_chat_label, chat_type="group"):
+                entry_id = signal_entry_chat_id(entry)
+                if entry_id:
+                    self._delete_alert_chat_id = entry_id
+                    break
+        if not self._delete_alert_chat_id:
+            import os
+
+            home = os.getenv("SIGNAL_HOME_CHANNEL", "").strip()
+            if home:
+                self._delete_alert_chat_id = home
+
+    # -- SQLite cache --------------------------------------------------------
 
     def _get_delete_cache_conn(self) -> sqlite3.Connection:
         if self._delete_cache_conn is None:
@@ -68,123 +111,28 @@ class DeleteWatchMixin:
             self._delete_cache_conn = conn
         return self._delete_cache_conn
 
-    def _delete_watch_storage_room_id(self) -> str:
-        if self._delete_watch_canonical_ids:
-            return sorted(self._delete_watch_canonical_ids)[0]
-        if self._delete_watch_aliases:
-            return sorted(self._delete_watch_aliases)[0]
-        return self._delete_watch_name or "delete-watch"
-
-    async def _prime_delete_watch_aliases(self) -> None:
-        if not self._delete_watch_active:
-            return
-
-        aliases = set(self._delete_watch_aliases)
-        labels = set(self._delete_watch_labels)
-        canonical_ids = set(self._delete_watch_canonical_ids)
-
-        for candidate in {self._delete_watch_name, self._delete_alert_chat_label}:
-            if not candidate:
-                continue
-            for entry in signal_directory_entries(candidate):
-                entry_id = signal_entry_chat_id(entry)
-                entry_name = str(entry.get("name") or "").strip()
-                if entry_id:
-                    canonical_ids.add(entry_id)
-                    aliases.add(normalize_token(entry_id))
-                if entry_name:
-                    aliases.add(normalize_token(entry_name))
-                    labels.add(entry_name)
-
-        if not self._delete_alert_chat_id and self._delete_alert_chat_label:
-            for entry in signal_directory_entries(self._delete_alert_chat_label, chat_type="group"):
-                entry_id = signal_entry_chat_id(entry)
-                if entry_id:
-                    self._delete_alert_chat_id = entry_id
-                    break
-
-        try:
-            contacts = await self._rpc("listContacts", {"account": self.account}) or []
-        except Exception as e:
-            logger.debug("Signal: delete-watch contact priming failed: %s", e)
-            contacts = []
-
-        for contact in contacts:
-            if not isinstance(contact, dict):
-                continue
-            name = str(contact.get("name") or contact.get("profileName") or "").strip()
-            recipient = str(contact.get("number") or contact.get("recipient") or "").strip()
-            service_id = str(contact.get("uuid") or contact.get("serviceId") or "").strip()
-            if not name and not recipient and not service_id:
-                continue
-
-            match_name = normalize_token(name) == normalize_token(self._delete_watch_name)
-            match_id = normalize_token(service_id) in aliases or normalize_token(recipient) in aliases
-            if not (match_name or match_id):
-                continue
-
-            if name:
-                aliases.add(normalize_token(name))
-                labels.add(name)
-            if recipient:
-                aliases.add(normalize_token(recipient))
-            if service_id:
-                aliases.add(normalize_token(service_id))
-                canonical_ids.add(service_id)
-                self._delete_watch_canonical_ids.add(service_id)
-
-        self._delete_watch_aliases = aliases
-        self._delete_watch_labels = labels or self._delete_watch_labels
-        self._delete_watch_canonical_ids = canonical_ids
-        self._delete_watch_active = bool(self._delete_watch_aliases)
-
-    def _message_matches_delete_watch(self, *objects: Any) -> bool:
-        if not self._delete_watch_active:
-            return False
-        return bool(message_tokens(*objects) & self._delete_watch_aliases)
-
-    async def _prune_delete_cache(self, *, force: bool = False) -> None:
-        now = time.time()
-        if not force and now - self._delete_cache_last_prune < DELETE_CACHE_PRUNE_INTERVAL_SECONDS:
-            return
-        async with self._delete_cache_lock:
-            conn = self._get_delete_cache_conn()
-            now_ms = int(now * 1000)
-            conn.execute("DELETE FROM deleted_message_cache WHERE expires_at <= ?", (now_ms,))
-            conn.execute(
-                "DELETE FROM processed_delete_events WHERE observed_at <= ?",
-                (now_ms - DELETE_CACHE_TTL_SECONDS * 1000,),
-            )
-            conn.commit()
-            self._delete_cache_last_prune = now
+    @staticmethod
+    def _compact_payload(data_message: dict) -> str:
+        """Store only what's needed to describe a recovered message (bounds row size)."""
+        atts = []
+        for a in (data_message.get("attachments") or []) if isinstance(data_message, dict) else []:
+            if isinstance(a, dict):
+                atts.append({"contentType": a.get("contentType"), "filename": a.get("filename")})
+        return json.dumps({"attachments": atts}, ensure_ascii=False)
 
     async def _store_delete_watch_message(
         self,
         *,
-        room_chat_id: str,
+        chat_id: str,
         room_label: str,
         sender_id: str,
         sender_name: str,
         timestamp_ms: int,
+        text: str,
         data_message: dict,
-        envelope_data: dict,
     ) -> None:
-        if not self._delete_watch_active:
-            return
-
-        payload = {
-            "room_chat_id": room_chat_id,
-            "room_label": room_label,
-            "sender_id": sender_id,
-            "sender_name": sender_name,
-            "timestamp_ms": timestamp_ms,
-            "data_message": data_message,
-            "envelope": envelope_data,
-        }
-        body = str(data_message.get("message") or "")
         now_ms = int(time.time() * 1000)
         expires_at = now_ms + DELETE_CACHE_TTL_SECONDS * 1000
-
         async with self._delete_cache_lock:
             conn = self._get_delete_cache_conn()
             conn.execute(
@@ -195,33 +143,29 @@ class DeleteWatchMixin:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    room_chat_id, room_label, sender_id, sender_name,
-                    timestamp_ms, body, json.dumps(payload, ensure_ascii=False),
+                    chat_id, room_label or "", sender_id or "", sender_name or "",
+                    timestamp_ms, text or "", self._compact_payload(data_message),
                     now_ms, expires_at,
                 ),
             )
             conn.commit()
         await self._prune_delete_cache()
 
-    async def _lookup_delete_watch_message(self, room_chat_id: str, deleted_ts: int) -> dict | None:
+    async def _lookup_delete_watch_message(self, chat_id: str, deleted_ts: int) -> dict | None:
         async with self._delete_cache_lock:
             conn = self._get_delete_cache_conn()
             rows = conn.execute(
                 """
                 SELECT * FROM deleted_message_cache
                 WHERE room_chat_id = ? AND message_ts BETWEEN ? AND ?
-                ORDER BY ABS(message_ts - ?), captured_at DESC LIMIT 3
+                ORDER BY ABS(message_ts - ?), captured_at DESC LIMIT 1
                 """,
-                (room_chat_id, deleted_ts - 2000, deleted_ts + 2000, deleted_ts),
+                (chat_id, deleted_ts - 2000, deleted_ts + 2000, deleted_ts),
             ).fetchall()
             if not rows:
                 rows = conn.execute(
-                    """
-                    SELECT * FROM deleted_message_cache
-                    WHERE room_chat_id = ? AND message_ts = ?
-                    ORDER BY captured_at DESC LIMIT 3
-                    """,
-                    (room_chat_id, deleted_ts),
+                    "SELECT * FROM deleted_message_cache WHERE room_chat_id = ? AND message_ts = ? LIMIT 1",
+                    (chat_id, deleted_ts),
                 ).fetchall()
         if not rows:
             return None
@@ -237,35 +181,31 @@ class DeleteWatchMixin:
             "sender_name": row["sender_name"],
             "timestamp_ms": row["message_ts"],
             "message_text": row["message_text"],
-            "captured_at": row["captured_at"],
-            "expires_at": row["expires_at"],
             "payload": payload,
         }
 
     async def _notify_delete_watch_message(self, record: dict, deleted_ts: int) -> None:
+        if not self._delete_alert_chat_id:
+            await self._resolve_alert_chat()
         alert_chat_id = self._delete_alert_chat_id
         if not alert_chat_id:
             logger.warning("Signal delete-watch: no alert chat configured; logging only")
-            logger.info("Signal delete-watch: %s", record)
+            logger.info("Signal delete-watch recovered: %s", record)
             return
 
-        room_label = record.get("room_label") or self._delete_watch_name
+        room_label = record.get("room_label") or record.get("room_chat_id") or "a chat"
         sender_name = record.get("sender_name") or record.get("sender_id") or "unknown"
         message_text = str(record.get("message_text") or "").strip()
-        payload = record.get("payload") or {}
-        data_message = payload.get("data_message") if isinstance(payload, dict) else {}
-        attachments = data_message.get("attachments") or [] if isinstance(data_message, dict) else []
+        atts = (record.get("payload") or {}).get("attachments") or []
 
         lines = [
-            f"Deleted message recovered from {room_label}",
+            f"🗑️ Deleted message recovered from {room_label}",
             f"Sender: {sender_name}",
-            f"Original timestamp: {record.get('timestamp_ms')}",
-            f"Delete timestamp: {deleted_ts}",
         ]
         if message_text:
             lines += ["", message_text]
-        elif attachments:
-            lines += ["", f"[attachment-only message with {len(attachments)} attachment(s)]"]
+        elif atts:
+            lines += ["", f"[attachment-only message with {len(atts)} attachment(s)]"]
         else:
             lines += ["", "[message body unavailable]"]
 
@@ -282,31 +222,112 @@ class DeleteWatchMixin:
         result = await self._rpc("send", params)
         if result is not None:
             self._track_sent_timestamp(result)
-            logger.info("Signal delete-watch: sent recovery notice room=%s ts=%s", room_label, deleted_ts)
+            audit("delete_recovered", group=record.get("room_chat_id", ""), actor=record.get("sender_id", ""))
+            logger.info("Signal delete-watch: recovery notice sent (room=%s ts=%s)", room_label, deleted_ts)
         else:
-            logger.warning("Signal delete-watch: failed to send recovery notice room=%s ts=%s", room_label, deleted_ts)
+            logger.warning("Signal delete-watch: failed to send recovery notice (room=%s)", room_label)
 
     async def _handle_delete_watch_event(
-        self,
-        *,
-        room_chat_id: str,
-        deleted_ts: int,
-        envelope_data: dict,
-        data_message: dict | None = None,
+        self, *, chat_id: str, room_label: str, deleted_ts: int, data_message: dict | None = None
     ) -> None:
         await self._prune_delete_cache()
         async with self._delete_cache_lock:
             conn = self._get_delete_cache_conn()
             inserted = conn.execute(
                 "INSERT OR IGNORE INTO processed_delete_events(room_chat_id, deleted_ts, observed_at) VALUES (?, ?, ?)",
-                (room_chat_id, deleted_ts, int(time.time() * 1000)),
+                (chat_id, deleted_ts, int(time.time() * 1000)),
             ).rowcount
             conn.commit()
         if not inserted:
-            logger.debug("Signal delete-watch: duplicate delete event ignored room=%s ts=%s", room_chat_id, deleted_ts)
+            logger.debug("Signal delete-watch: duplicate delete event ignored (room=%s ts=%s)", chat_id, deleted_ts)
             return
-        record = await self._lookup_delete_watch_message(room_chat_id, deleted_ts)
+        record = await self._lookup_delete_watch_message(chat_id, deleted_ts)
         if record is None:
-            logger.warning("Signal delete-watch: delete event for %s ts=%s had no cached message", room_chat_id, deleted_ts)
+            logger.info(
+                "Signal delete-watch: delete in %s (ts=%s) had no cached original (sent before capture or expired)",
+                chat_id, deleted_ts,
+            )
             return
         await self._notify_delete_watch_message(record, deleted_ts)
+
+    # -- cleanup -------------------------------------------------------------
+
+    async def _prune_delete_cache(self, *, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self._delete_cache_last_prune < DELETE_CACHE_PRUNE_INTERVAL_SECONDS:
+            return
+        async with self._delete_cache_lock:
+            conn = self._get_delete_cache_conn()
+            now_ms = int(now * 1000)
+            # 1. TTL: drop anything past Signal's delete window (+buffer).
+            deleted = conn.execute("DELETE FROM deleted_message_cache WHERE expires_at <= ?", (now_ms,)).rowcount
+            conn.execute(
+                "DELETE FROM processed_delete_events WHERE observed_at <= ?",
+                (now_ms - DELETE_CACHE_TTL_SECONDS * 1000,),
+            )
+            # 2. Size backstop: cap total rows, evicting oldest.
+            max_rows = self._delete_watch_max_rows()
+            total = conn.execute("SELECT COUNT(*) FROM deleted_message_cache").fetchone()[0]
+            if total > max_rows:
+                over = total - max_rows
+                conn.execute(
+                    "DELETE FROM deleted_message_cache WHERE id IN "
+                    "(SELECT id FROM deleted_message_cache ORDER BY expires_at ASC LIMIT ?)",
+                    (over,),
+                )
+                deleted += over
+                logger.info("Signal delete-watch: evicted %d oldest rows (cap=%d)", over, max_rows)
+            conn.commit()
+            self._delete_cache_last_prune = now
+            # 3. Reclaim disk periodically (SQLite doesn't shrink the file on DELETE).
+            last_vac = getattr(self, "_delete_cache_last_vacuum", 0.0)
+            if deleted and (now - last_vac > _VACUUM_INTERVAL_SECONDS):
+                try:
+                    conn.execute("VACUUM")
+                    self._delete_cache_last_vacuum = now
+                    logger.debug("Signal delete-watch: VACUUM reclaimed cache file space")
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("Signal delete-watch: VACUUM failed: %s", exc)
+
+    def delete_cache_stats(self) -> dict:
+        """Stats for /delete-watch status: depth, staleness, ages, per-room, recoveries."""
+        out = {
+            "rows": 0, "rooms": 0, "stale": 0, "fresh": 0,
+            "oldest_age_min": 0, "newest_age_min": 0, "top_rooms": [],
+            "processed_events": 0, "max_rows": self._delete_watch_max_rows(),
+            "ttl_hours": round(DELETE_CACHE_TTL_SECONDS / 3600, 1),
+            "db_bytes": 0,
+        }
+        try:
+            now_ms = int(time.time() * 1000)
+            conn = self._get_delete_cache_conn()
+            r = conn.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT room_chat_id), MIN(message_ts), MAX(message_ts), "
+                "SUM(CASE WHEN expires_at <= ? THEN 1 ELSE 0 END) FROM deleted_message_cache",
+                (now_ms,),
+            ).fetchone()
+            total = r[0] or 0
+            stale = r[4] or 0
+            out.update(
+                rows=total,
+                rooms=r[1] or 0,
+                stale=stale,
+                fresh=total - stale,
+                oldest_age_min=int((now_ms - r[2]) / 60000) if r[2] else 0,
+                newest_age_min=int((now_ms - r[3]) / 60000) if r[3] else 0,
+            )
+            out["top_rooms"] = [
+                (row["room_label"] or row["room_chat_id"], row["c"])
+                for row in conn.execute(
+                    "SELECT room_label, room_chat_id, COUNT(*) c FROM deleted_message_cache "
+                    "GROUP BY room_chat_id ORDER BY c DESC LIMIT 5"
+                ).fetchall()
+            ]
+            out["processed_events"] = conn.execute("SELECT COUNT(*) FROM processed_delete_events").fetchone()[0]
+            try:
+                out["db_bytes"] = self._delete_cache_path.stat().st_size
+            except OSError:
+                pass
+        except Exception as exc:  # pragma: no cover
+            logger.debug("delete_cache_stats failed: %s", exc)
+        return out

@@ -8,6 +8,7 @@ core dangerous-command approval flow still works.
 
 from __future__ import annotations
 
+from ._util import signal_directory_entries, signal_entry_chat_id
 from .config_store import is_valid_identifier
 from .observability import audit, count, snapshot
 
@@ -19,13 +20,42 @@ _HELP = (
     "/agent <msg> — summon me (group mode)\n"
     "/approve <id> · /revoke <id> — manage members\n"
     "/wake add|remove|list <word> — wake-words\n"
+    "/delete-watch add|remove *|here|<room> · list — recover deleted messages\n"
     "/status — current mode & stats\n"
     "/forget — clear my memory of recent chat\n"
     "/help — this message"
 )
 
 # command prefixes we intercept (lowercased, first token)
-COMMAND_PREFIXES = ("/mode", "/status", "/forget", "/wake", "/help", "/approve", "/revoke")
+COMMAND_PREFIXES = (
+    "/mode", "/status", "/forget", "/wake", "/help", "/approve", "/revoke",
+    "/delete-watch", "/watch",
+)
+
+
+def _resolve_room(ref: str, current_group_id: str) -> str | None:
+    """Resolve a /delete-watch target to a chat_id, '*', or None.
+
+    Accepts '*' (all), 'here' (this room), an explicit chat_id (group:… / +num),
+    a bare group id (base64), or a room name (looked up in the channel directory).
+    """
+    ref = (ref or "").strip()
+    if ref in ("", "list"):
+        return None
+    if ref == "*":
+        return "*"
+    if ref.lower() == "here":
+        return f"group:{current_group_id}" if current_group_id else None
+    if ref.startswith("group:") or ref.startswith("+"):
+        return ref
+    for e in signal_directory_entries(ref):
+        cid = signal_entry_chat_id(e)
+        if cid:
+            return cid
+    # Looks like a bare group id (base64) — prefix it.
+    if ref.endswith("=") and "/" not in ref[:1]:
+        return f"group:{ref}"
+    return ref
 
 
 def looks_like_command(text: str) -> bool:
@@ -90,6 +120,53 @@ async def handle_owner_command(adapter, text: str, group_id: str, sender: str) -
             audit("wake_remove", group=group_id, actor=sender, word=word)
             return f"Removed wake-word '{word.lower()}'." if ok else f"'{word.lower()}' wasn't set."
         return "Usage: /wake add|remove|list <word>"
+
+    if cmd in ("/delete-watch", "/watch"):
+        sub = arg.split(None, 1)
+        action = sub[0].lower() if sub else ""
+        ref = sub[1].strip() if len(sub) > 1 else ""
+        if action in ("", "list", "status"):
+            all_on = store.delete_watch_all()
+            rooms = store.delete_watch_rooms()
+            s = adapter.delete_cache_stats()
+            scope = "ALL rooms" if all_on else (f"{len(rooms)} room(s)" if rooms else "OFF (no rooms watched)")
+
+            def _age(mins):
+                return f"{mins // 60}h{mins % 60:02d}m" if mins >= 60 else f"{mins}m"
+
+            lines = [
+                "🗑️ Delete-watch status",
+                f"Scope: {scope}",
+                f"Retention: {s['ttl_hours']}h (Signal delete window 24h + 2h buffer)",
+                f"Cached: {s['rows']} msg(s) across {s['rooms']} room(s) "
+                f"(cap {s['max_rows']}, db {s['db_bytes'] // 1024} KB)",
+                f"Fresh: {s['fresh']} · Stale/pending-prune: {s['stale']}",
+                f"Oldest: {_age(s['oldest_age_min'])} ago · Newest: {_age(s['newest_age_min'])} ago"
+                if s["rows"] else "Oldest/Newest: —",
+                f"Deletes recovered/seen: {s['processed_events']}",
+            ]
+            if all_on and s["top_rooms"]:
+                lines.append("Top rooms: " + ", ".join(f"{lbl} ({c})" for lbl, c in s["top_rooms"]))
+            elif rooms and not all_on:
+                lines.append("Watching: " + ", ".join((r[:24] + "…") if len(r) > 24 else r for r in rooms))
+            return "\n".join(lines)
+        if action in ("add", "on", "enable"):
+            target = _resolve_room(ref, group_id)
+            if not target:
+                return "Usage: /delete-watch add *|here|<room name or id>"
+            ok = store.delete_watch_add(target)
+            audit("delete_watch_add", group=group_id, actor=sender, target=target)
+            label = "all rooms" if target == "*" else target
+            return f"🗑️ Now watching {label} for deleted messages." if ok else f"Already watching {label}."
+        if action in ("remove", "off", "disable", "rm"):
+            target = _resolve_room(ref, group_id)
+            if not target:
+                return "Usage: /delete-watch remove *|here|<room name or id>"
+            ok = store.delete_watch_remove(target)
+            audit("delete_watch_remove", group=group_id, actor=sender, target=target)
+            label = "all rooms" if target == "*" else target
+            return f"Stopped watching {label}." if ok else f"{label} wasn't being watched."
+        return "Usage: /delete-watch add|remove *|here|<room> · /delete-watch list"
 
     if cmd in ("/approve", "/revoke"):
         # Leave bare / security-keyword forms to the core approval flow.

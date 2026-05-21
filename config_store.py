@@ -77,7 +77,16 @@ class ConfigStore:
     # -- low-level load/save -------------------------------------------------
 
     def _default_doc(self) -> dict:
-        return {"version": 1, "approved": {}, "global_approved": [], "dynamic_groups": [], "modes": {}}
+        return {
+            "version": 1,
+            "approved": {},
+            "global_approved": [],
+            "dynamic_groups": [],
+            "modes": {},
+            # delete-watch: OFF by default. Opt-in per room, or "all" for every chat.
+            # Runtime state (lives here, NOT env) so /delete-watch reloads live.
+            "delete_watch": {"all": False, "rooms": []},
+        }
 
     def _file_sig(self) -> tuple | None:
         try:
@@ -154,6 +163,14 @@ class ConfigStore:
                 legacy = json.loads(_LEGACY_MODES.read_text(encoding="utf-8"))
                 if isinstance(legacy, dict):
                     doc["modes"] = legacy
+            # Bootstrap-only delete-watch seed from env (real-time control is via
+            # the store/commands afterwards, never re-read from env). "*" = all rooms.
+            seed = os.getenv("SIGNAL_DELETE_WATCH_ROOMS", "").strip()
+            if seed:
+                if seed == "*":
+                    doc["delete_watch"] = {"all": True, "rooms": []}
+                else:
+                    doc["delete_watch"] = {"all": False, "rooms": [s.strip() for s in seed.split(",") if s.strip()]}
         except Exception as exc:
             logger.warning("signal-group-chat: legacy seed failed: %s", exc)
         try:
@@ -248,5 +265,55 @@ class ConfigStore:
             if word not in words:
                 return False
             words.remove(word)
+            return True
+        return self._mutate(_fn)
+
+    # -- delete-watch (OFF by default; opt-in per room or "*" for all) -------
+
+    def _dw(self) -> dict:
+        dw = self._load().get("delete_watch") or {}
+        return dw if isinstance(dw, dict) else {}
+
+    def delete_watch_all(self) -> bool:
+        return bool(self._dw().get("all", False))
+
+    def delete_watch_rooms(self) -> list:
+        return list(self._dw().get("rooms", []))
+
+    def delete_watch_enabled(self, chat_id: str) -> bool:
+        dw = self._dw()
+        if dw.get("all"):
+            return True
+        return chat_id in (dw.get("rooms") or [])
+
+    def delete_watch_add(self, target: str) -> bool:
+        """Watch a room, or '*' for all rooms. Returns True if state changed."""
+        def _fn(doc):
+            dw = doc.setdefault("delete_watch", {"all": False, "rooms": []})
+            if target == "*":
+                if dw.get("all"):
+                    return False
+                dw["all"] = True
+                return True
+            rooms = dw.setdefault("rooms", [])
+            if target in rooms:
+                return False
+            rooms.append(target)
+            return True
+        return self._mutate(_fn)
+
+    def delete_watch_remove(self, target: str) -> bool:
+        """Stop watching a room, or '*' to turn off global all-rooms. Returns True if changed."""
+        def _fn(doc):
+            dw = doc.setdefault("delete_watch", {"all": False, "rooms": []})
+            if target == "*":
+                if not dw.get("all"):
+                    return False
+                dw["all"] = False
+                return True
+            rooms = dw.setdefault("rooms", [])
+            if target not in rooms:
+                return False
+            rooms.remove(target)
             return True
         return self._mutate(_fn)

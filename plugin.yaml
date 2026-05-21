@@ -61,11 +61,15 @@ optional_env:
     description: "Bot display name used for @mention summon detection."
     prompt: "Bot display name"
     password: false
-  - name: SIGNAL_DELETE_WATCH_NAME
-    description: "Contact/room name to watch for deleted messages."
-    prompt: "Delete-watch name"
+  - name: SIGNAL_DELETE_WATCH_ROOMS
+    description: "Bootstrap-only seed for delete-watch: '*' = all rooms, or comma-separated chat ids. Default OFF. Runtime control is /delete-watch (stored in the pairing file, not env)."
+    prompt: "Delete-watch rooms ('*' or ids, blank=off)"
     password: false
   - name: SIGNAL_DELETE_ALERT_CHAT_ID
-    description: "Chat that receives recovered deleted-message notices."
+    description: "Central chat that receives recovered deleted-message notices (defaults to SIGNAL_HOME_CHANNEL)."
     prompt: "Delete-watch alert chat id"
+    password: false
+  - name: SIGNAL_DELETE_MAX_ROWS
+    description: "Safety cap on cached messages (oldest evicted beyond this). Default 50000."
+    prompt: "Delete-watch cache row cap"
     password: false
