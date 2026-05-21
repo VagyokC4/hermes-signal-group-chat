@@ -1,0 +1,71 @@
+manifest_version: 1
+name: signal-group-chat
+label: Signal (Group Chat)
+kind: platform
+version: 0.1.0
+description: >
+  Production Signal platform plugin for Hermes Agent. Subclasses the upstream
+  Signal adapter and adds: owner/guest access control with per-group /approve
+  & /revoke, dynamic group allowlist, deleted-message watching, automatic file
+  staging to the shared signal-cli volume, and a /single vs /group mode system
+  where the agent listens passively to a group and only engages when summoned
+  (/agent, @mention, reply, or a wake-word). Registers as platform "signal",
+  overriding the built-in adapter — all existing SIGNAL_* env vars keep working.
+author: VagyokC4
+
+# Surfaced by `hermes config` / `hermes plugins install` prompts.
+requires_env:
+  - name: SIGNAL_HTTP_URL
+    description: "signal-cli HTTP daemon URL (e.g. http://signal-cli-rest-api:8080)"
+    prompt: "signal-cli HTTP URL"
+    password: false
+  - name: SIGNAL_ACCOUNT
+    description: "Your Signal phone number in E.164 (e.g. +14155552671)"
+    prompt: "Signal account number"
+    password: false
+
+optional_env:
+  - name: SIGNAL_OWNER_USERS
+    description: "Comma-separated owner identifiers (phone/UUID). Defaults to SIGNAL_ACCOUNT."
+    prompt: "Owner identifiers"
+    password: false
+  - name: SIGNAL_GROUP_ALLOWED_USERS
+    description: "Comma-separated group IDs Hermes listens in ('*' = all)."
+    prompt: "Allowed group IDs"
+    password: false
+  - name: SIGNAL_ALLOWED_USERS
+    description: "DM allowlist gate ('*' = open; patch enforces owner-only DMs)."
+    prompt: "Allowed DM users"
+    password: false
+  - name: SIGNAL_NOTE_TO_SELF
+    description: "Set false to ignore Note-to-Self messages (default true)."
+    prompt: "Process Note to Self? (true/false)"
+    password: false
+  - name: SIGNAL_HOME_CHANNEL
+    description: "group:<id> of the admin channel for owner access-request notices."
+    prompt: "Home channel (group:ID)"
+    password: false
+  - name: SIGNAL_REACTIONS
+    description: "Emoji processing reactions 👀→✅/❌ (default true)."
+    prompt: "Enable reactions? (true/false)"
+    password: false
+  - name: SIGNALGC_DEFAULT_MODE
+    description: "Default per-group mode for new groups: single or group (default single)."
+    prompt: "Default group mode (single/group)"
+    password: false
+  - name: SIGNALGC_SUMMON_KEYWORD
+    description: "Summon prefix for /group mode (default /agent)."
+    prompt: "Summon keyword"
+    password: false
+  - name: SIGNALGC_BOT_NAME
+    description: "Bot display name used for @mention summon detection."
+    prompt: "Bot display name"
+    password: false
+  - name: SIGNAL_DELETE_WATCH_NAME
+    description: "Contact/room name to watch for deleted messages."
+    prompt: "Delete-watch name"
+    password: false
+  - name: SIGNAL_DELETE_ALERT_CHAT_ID
+    description: "Chat that receives recovered deleted-message notices."
+    prompt: "Delete-watch alert chat id"
+    password: false

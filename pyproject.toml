@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-signal-group-chat"
+version = "0.1.0"
+description = "Signal group-chat platform plugin for Hermes Agent (modes, access control, delete-watch, file staging)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "VagyokC4" }]
+dependencies = ["httpx"]
+
+# Lets the plugin also be installed as a pip package that Hermes discovers via
+# the `hermes_agent.plugins` entry-point group (in addition to the git-clone
+# install into ~/.hermes/plugins/). Both paths call register(ctx).
+[project.entry-points."hermes_agent.plugins"]
+signal-group-chat = "signal_group_chat:register"
+
+[tool.setuptools]
+packages = ["signal_group_chat"]
+package-dir = { "signal_group_chat" = "." }
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = false
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+# Run from the repo root: `python -m pytest`. importlib mode avoids importing the
+# package __init__ as a collected module (the dir name contains a hyphen).
+addopts = "--import-mode=importlib -p no:cacheprovider"
+testpaths = ["tests"]
